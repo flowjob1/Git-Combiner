@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import json
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -85,6 +89,23 @@ def check_or_prompt_auth() -> None:
     login = run_command(["gh", "auth", "login"], check=False, capture=False)
     if login.returncode != 0:
         raise SystemExit("GitHub login failed. Please authenticate and rerun.")
+
+
+def prompt_non_empty(prompt: str) -> str:
+    while True:
+        value = input(prompt).strip()
+        if value:
+            return value
+        print("Value cannot be empty.")
+
+
+def prompt_repo_name() -> str:
+    pattern = re.compile(r"^[A-Za-z0-9_.-]+$")
+    while True:
+        value = prompt_non_empty("Enter the new GitHub repository name: ")
+        if pattern.match(value):
+            return value
+        print("Invalid name. Use only letters, digits, '.', '_' or '-'.")
 
 
 def parse_repo_input(raw: str) -> RepoSpec:
@@ -277,6 +298,111 @@ def verify_result(target: Path, selections: Sequence[RepoSelection]) -> None:
             run_command(["git", "merge-base", "--is-ancestor", import_branch, combined_branch], cwd=target)
 
 
+def github_api_request(method: str, path: str, token: str, payload: dict | None = None) -> dict:
+    url = f"https://api.github.com{path}"
+    body = None
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "git-combiner",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url=url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request) as response:
+            content = response.read().decode("utf-8")
+            return json.loads(content) if content else {}
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"GitHub API request failed ({error.code}): {details}") from error
+    except urllib.error.URLError as error:
+        raise SystemExit(f"GitHub API request failed: {error}") from error
+
+
+def ensure_github_token() -> str:
+    while True:
+        token = getpass.getpass("Enter a GitHub personal access token (repo scope): ").strip()
+        if not token:
+            print("Token cannot be empty.")
+            continue
+        user = github_api_request("GET", "/user", token)
+        login = user.get("login")
+        if login:
+            print(f"Authenticated as GitHub user: {login}")
+            return token
+        print("Token validation failed. Please try again.")
+
+
+def create_github_repo_with_gh(repo_name: str, private_repo: bool) -> str:
+    visibility = "--private" if private_repo else "--public"
+    run_command(["gh", "repo", "create", repo_name, visibility, "--confirm"])
+    owner = run_command(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
+    if not owner:
+        raise SystemExit("Failed to resolve authenticated GitHub user via gh.")
+    return f"https://github.com/{owner}/{repo_name}.git"
+
+
+def create_github_repo_with_api(repo_name: str, private_repo: bool) -> str:
+    token = ensure_github_token()
+    created = github_api_request(
+        "POST",
+        "/user/repos",
+        token,
+        {"name": repo_name, "private": private_repo},
+    )
+    clone_url = created.get("clone_url")
+    if not clone_url:
+        raise SystemExit("GitHub API did not return a clone URL for the created repository.")
+    return clone_url
+
+
+def publish_combined_repo(target: Path, selections: Sequence[RepoSelection], dry_run: bool) -> None:
+    if not prompt_yes_no("Do you want to push the combined repository to GitHub?"):
+        return
+
+    repo_name = prompt_repo_name()
+    private_repo = prompt_yes_no("Create the new GitHub repository as private?")
+    has_gh = shutil.which("gh") is not None
+
+    if has_gh:
+        print("Using GitHub CLI (gh) for authentication and repository creation.")
+        if not dry_run:
+            check_or_prompt_auth()
+            remote_url = create_github_repo_with_gh(repo_name, private_repo)
+        else:
+            remote_url = f"https://github.com/<authenticated-user>/{repo_name}.git"
+    else:
+        print("GitHub CLI (gh) not found. Using GitHub API token flow for repository creation.")
+        if not dry_run:
+            remote_url = create_github_repo_with_api(repo_name, private_repo)
+        else:
+            remote_url = f"https://github.com/<token-user>/{repo_name}.git"
+
+    def execute(command: Sequence[str]) -> None:
+        print(f"[{target}] $ {' '.join(command)}")
+        if not dry_run:
+            run_command(command, cwd=target)
+
+    if not dry_run:
+        existing_origin = run_command(
+            ["git", "remote", "get-url", "origin"], cwd=target, check=False
+        )
+        if existing_origin.returncode == 0:
+            raise SystemExit("Remote 'origin' already exists in target repository.")
+
+    execute(["git", "remote", "add", "origin", remote_url])
+    execute(["git", "push", "-u", "origin", "combined-root"])
+    for selection in selections:
+        for branch in selection.branches:
+            combined_branch = f"combined/{selection.alias}/{sanitize_branch_name(branch)}"
+            execute(["git", "push", "-u", "origin", combined_branch])
+    print(f"Repository published to {remote_url}")
+
+
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Combine multiple GitHub repositories preserving branch history.")
     parser.add_argument(
@@ -291,7 +417,6 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     ensure_git_installed()
-    check_or_prompt_auth()
 
     selections = collect_repositories()
     target = Path(args.target_dir).resolve()
@@ -308,6 +433,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not args.dry_run:
         verify_result(target, selections)
         print(f"Combination finished successfully in: {target}")
+        publish_combined_repo(target, selections, args.dry_run)
 
     return 0
 
